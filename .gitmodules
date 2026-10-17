@@ -1,0 +1,3 @@
+[submodule "demos/watchos"]
+    path = demos/watchos
+    url = https://github.com/AstralSightStudios/AstroBox-NG-Demo-WatchOS
