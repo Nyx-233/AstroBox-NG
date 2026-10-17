@@ -1,0 +1,136 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      frontend_repository:
+        description: "Frontend repository containing your fix (owner/repo)"
+        required: true
+        type: string
+      frontend_branch:
+        description: "Frontend branch containing your fix"
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      PYTHONUTF8: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout main project
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check source token
+        env:
+          ASTROBOX_SOURCE_TOKEN: ${{ secrets.ASTROBOX_SOURCE_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:ASTROBOX_SOURCE_TOKEN)) {
+            throw "Add the ASTROBOX_SOURCE_TOKEN repository secret first. It must be able to read the private source repositories."
+          }
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Select your frontend source
+        shell: python
+        env:
+          FRONTEND_REPOSITORY: ${{ inputs.frontend_repository }}
+          FRONTEND_BRANCH: ${{ inputs.frontend_branch }}
+        run: |
+          import os
+          import xml.etree.ElementTree as ET
+
+          repository = os.environ["FRONTEND_REPOSITORY"].strip()
+          parts = repository.split("/")
+          if len(parts) != 2 or any(
+              not part or part in (".", "..") or
+              not all(c.isascii() and (c.isalnum() or c in "_.-") for c in part)
+              for part in parts
+          ):
+              raise SystemExit("Enter the frontend repository as owner/repo, without a URL.")
+
+          branch = os.environ["FRONTEND_BRANCH"].strip()
+          if not branch:
+              raise SystemExit("The frontend branch cannot be empty.")
+
+          tree = ET.parse("repos.xml")
+          frontend = next(
+              (repo for repo in tree.getroot().findall("repo")
+               if repo.get("path") == "web"),
+              None,
+          )
+          if frontend is None:
+              raise SystemExit("repos.xml has no repository with path=web.")
+
+          frontend.set("url", f"https://github.com/{repository}.git")
+          frontend.set("branch", branch)
+          tree.write("repos.xml", encoding="utf-8", xml_declaration=True)
+
+      - name: Download source repositories on the runner
+        env:
+          ASTROBOX_SOURCE_TOKEN: ${{ secrets.ASTROBOX_SOURCE_TOKEN }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          $astroboxGitAuth = [Convert]::ToBase64String(
+            [Text.Encoding]::UTF8.GetBytes("x-access-token:$env:ASTROBOX_SOURCE_TOKEN")
+          )
+          Write-Output "::add-mask::$astroboxGitAuth"
+          $env:GIT_CONFIG_COUNT = "1"
+          $env:GIT_CONFIG_KEY_0 = "http.https://github.com/.extraheader"
+          $env:GIT_CONFIG_VALUE_0 = "AUTHORIZATION: basic $astroboxGitAuth"
+          python abtools.py sync --private --prefer abort
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (!(Test-Path "src-tauri/modules/app/Cargo.toml")) {
+            throw "The app module is missing. Check access to the private repositories."
+          }
+          if (!(Test-Path "web/src/logic/pluginWindow.ts")) {
+            throw "The frontend source is missing."
+          }
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: |
+          npm install --global pnpm@10
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Windows installer
+        run: |
+          $astroboxCiConfig = Join-Path $env:RUNNER_TEMP "astrobox-ci.json"
+          '{"bundle":{"createUpdaterArtifacts":false}}' |
+            Set-Content -Path $astroboxCiConfig -Encoding utf8NoBOM
+          pnpm tauri build --bundles nsis --config $astroboxCiConfig
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: AstroBox-Windows-x64
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
